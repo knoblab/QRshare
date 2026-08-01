@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>OPTICAL_QR_TRANSFER</title>
+<link rel="stylesheet" href="style.css">
+<!-- QR Code Generator (Kazuhiko Arase) -->
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+<!-- jsQR Decoder -->
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="brand">OPTICAL_QR_TRANSFER<span class="cursor">_</span></div>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="send">[1] SEND</button>
+    <button class="tab-btn" data-tab="recv">[2] RECEIVE</button>
+  </nav>
+</header>
+
+<main>
+
+  <!-- ============ SEND ============ -->
+  <section id="panel-send" class="panel active">
+    <div class="grid">
+
+      <div class="box">
+        <div class="box-title">$ source_file</div>
+
+        <label class="drop-zone" id="dropZone">
+          <input type="file" id="fileInput">
+          <div id="dropText">&gt; 파일을 드래그하거나 클릭하여 선택</div>
+          <div id="fileInfo" class="file-info hidden">
+            <div id="fileName" class="file-name"></div>
+            <div id="fileSize" class="file-size"></div>
+          </div>
+        </label>
+
+        <div class="field">
+          <div class="field-label">CHUNK_SIZE <span id="chunkSizeVal" class="val">300</span> bytes</div>
+          <input type="range" id="chunkSize" min="50" max="1000" step="10" value="300">
+        </div>
+
+        <div class="field">
+          <div class="field-label">FRAME_RATE <span id="fpsVal" class="val">5</span> fps</div>
+          <input type="range" id="fps" min="1" max="12" step="1" value="5">
+        </div>
+
+        <div class="field">
+          <div class="field-label">ERROR_CORRECTION_LEVEL</div>
+          <div class="btn-row" id="eccGroup">
+            <button class="btn-sm" data-ecc="L">L</button>
+            <button class="btn-sm" data-ecc="M">M</button>
+            <button class="btn-sm active" data-ecc="Q">Q</button>
+            <button class="btn-sm" data-ecc="H">H</button>
+          </div>
+        </div>
+
+        <div class="hint"># TIP: 청크 크기를 작게, ECC를 H로 설정할수록 인식률이 올라갑니다 (대신 속도는 느려집니다)</div>
+
+        <button id="btnStartSend" class="btn-main" disabled>▶ START_TRANSMISSION</button>
+        <button id="btnStopSend" class="btn-main btn-stop hidden">■ STOP</button>
+      </div>
+
+      <div class="box">
+        <div class="box-title">$ qr_output</div>
+
+        <div class="qr-box">
+          <canvas id="qrCanvas"></canvas>
+          <div id="qrIdle" class="overlay-idle">STANDBY</div>
+        </div>
+
+        <div class="progress-track"><div id="sendProgress" class="progress-fill"></div></div>
+
+        <div class="stat-line">
+          FRAME <span id="sendFrameIdx">0</span>/<span id="sendFrameTotal">0</span>
+          &nbsp;|&nbsp; LOOP <span id="sendLoopCount">0</span>
+        </div>
+
+        <div class="divider">── VIDEO_EXPORT ──</div>
+
+        <div class="field">
+          <div class="field-label">EXPORT_REPEATS <span id="exportRepeatsVal" class="val">2</span>x</div>
+          <input type="range" id="exportRepeats" min="1" max="5" step="1" value="2">
+        </div>
+
+        <div class="btn-row">
+          <button id="btnExportVideo" class="btn-main btn-ghost" disabled>⬇ EXPORT_QR_VIDEO</button>
+          <button id="btnStopExport" class="btn-main btn-stop hidden">■ STOP</button>
+        </div>
+
+        <div class="progress-track"><div id="exportProgress" class="progress-fill"></div></div>
+        <div id="exportStatusLine" class="stat-line"></div>
+
+        <div id="sendLog" class="log"></div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ RECEIVE ============ -->
+  <section id="panel-recv" class="panel">
+    <div class="grid">
+
+      <div class="box">
+        <div class="box-title">$ camera_input</div>
+
+        <div class="video-box">
+          <video id="video" playsinline muted></video>
+          <div class="scan-frame"></div>
+          <div id="videoIdle" class="overlay-idle">CAMERA_OFF</div>
+        </div>
+
+        <div class="btn-row btn-row-wrap">
+          <button id="btnStartScan" class="btn-main">▶ START_SCAN</button>
+          <button id="btnStopScan" class="btn-main btn-stop hidden">■ STOP</button>
+          <button id="btnReset" class="btn-main btn-ghost">RESET</button>
+        </div>
+
+        <div class="divider">── OR: VIDEO_UPLOAD ──</div>
+
+        <label class="drop-zone" id="videoDropZone">
+          <input type="file" id="videoFileInput" accept="video/*">
+          <div id="videoDropText">&gt; QR 스트림이 담긴 영상 파일을 선택</div>
+          <div id="videoFileInfo" class="file-info hidden">
+            <div id="videoFileName" class="file-name"></div>
+          </div>
+        </label>
+
+        <div class="field">
+          <div class="field-label">SAMPLE_INTERVAL <span id="sampleIntervalVal" class="val">70</span> ms</div>
+          <input type="range" id="sampleInterval" min="20" max="300" step="10" value="70">
+        </div>
+
+        <div class="btn-row">
+          <button id="btnAnalyzeVideo" class="btn-main" disabled>▶ ANALYZE_VIDEO</button>
+          <button id="btnStopAnalyze" class="btn-main btn-stop hidden">■ STOP</button>
+        </div>
+
+        <div class="progress-track"><div id="analyzeProgress" class="progress-fill"></div></div>
+        <div id="analyzeStatusLine" class="stat-line"></div>
+      </div>
+
+      <div class="box">
+        <div class="box-title">$ receive_status</div>
+
+        <div class="metric-grid">
+          <div class="metric"><div class="metric-label">RECEIVED</div><div id="mRecv" class="metric-val">0/0</div></div>
+          <div class="metric"><div class="metric-label">CORRUPT_FRAMES</div><div id="mCorrupt" class="metric-val">0</div></div>
+          <div class="metric"><div class="metric-label">ELAPSED</div><div id="mElapsed" class="metric-val">00:00</div></div>
+          <div class="metric"><div class="metric-label">THROUGHPUT</div><div id="mSpeed" class="metric-val">0 B/s</div></div>
+        </div>
+
+        <div id="chunkMatrix" class="chunk-matrix"></div>
+
+        <div id="recvResult" class="recv-result hidden">
+          <div id="recvFileName" class="recv-filename"></div>
+          <a id="recvDownload" class="btn-main" download>⬇ DOWNLOAD_FILE</a>
+        </div>
+
+        <div id="recvLog" class="log"></div>
+      </div>
+
+    </div>
+  </section>
+
+</main>
+
+<script src="script.js"></script>
+</body>
+</html>
