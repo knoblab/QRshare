@@ -39,26 +39,33 @@
         </label>
 
         <div class="field">
-          <div class="field-label">CHUNK_SIZE <span id="chunkSizeVal" class="val">300</span> bytes</div>
-          <input type="range" id="chunkSize" min="50" max="1000" step="10" value="300">
+          <label class="checkbox-label">
+            <input type="checkbox" id="useCompression" checked>
+            <span>USE_GZIP_COMPRESSION (대용량/MB 필수)</span>
+          </label>
         </div>
 
         <div class="field">
-          <div class="field-label">FRAME_RATE <span id="fpsVal" class="val">5</span> fps</div>
-          <input type="range" id="fps" min="1" max="12" step="1" value="5">
+          <div class="field-label">CHUNK_SIZE <span id="chunkSizeVal" class="val">800</span> bytes</div>
+          <input type="range" id="chunkSize" min="50" max="1500" step="10" value="800">
+        </div>
+
+        <div class="field">
+          <div class="field-label">FRAME_RATE <span id="fpsVal" class="val">8</span> fps</div>
+          <input type="range" id="fps" min="1" max="15" step="1" value="8">
         </div>
 
         <div class="field">
           <div class="field-label">ERROR_CORRECTION_LEVEL</div>
           <div class="btn-row" id="eccGroup">
             <button class="btn-sm" data-ecc="L">L</button>
-            <button class="btn-sm" data-ecc="M">M</button>
-            <button class="btn-sm active" data-ecc="Q">Q</button>
+            <button class="btn-sm active" data-ecc="M">M</button>
+            <button class="btn-sm" data-ecc="Q">Q</button>
             <button class="btn-sm" data-ecc="H">H</button>
           </div>
         </div>
 
-        <div class="hint"># TIP: 청크 크기를 작게, ECC를 H로 설정할수록 인식률이 올라갑니다 (대신 속도는 느려집니다)</div>
+        <div class="hint"># TIP: MB 단위 파일은 GZIP 활성화 + CHUNK_SIZE 800B 이상 설정을 권장합니다.</div>
 
         <button id="btnStartSend" class="btn-main" disabled>▶ START_TRANSMISSION</button>
         <button id="btnStopSend" class="btn-main btn-stop hidden">■ STOP</button>
@@ -153,7 +160,10 @@
           <div class="metric"><div class="metric-label">THROUGHPUT</div><div id="mSpeed" class="metric-val">0 B/s</div></div>
         </div>
 
-        <div id="chunkMatrix" class="chunk-matrix"></div>
+        <!-- 캔버스 기반 수신 매트릭스 -->
+        <div class="matrix-wrapper">
+          <canvas id="matrixCanvas" class="matrix-canvas"></canvas>
+        </div>
 
         <div id="recvResult" class="recv-result hidden">
           <div id="recvFileName" class="recv-filename"></div>

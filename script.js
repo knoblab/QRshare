@@ -1,35 +1,20 @@
 'use strict';
 
 /* ==========================================================
-   OPTICAL_QR_TRANSFER
-   프레임 포맷: QRS1|SID|IDX|TOTAL|CRC32|BASE64_DATA
-     - SID   : 4자리 세션 식별자 (전송 시작마다 새로 생성)
-     - IDX   : 프레임 번호 (0 = 메타데이터, 1..N = 데이터 청크)
-     - TOTAL : 전체 프레임 수 (메타데이터 포함)
-     - CRC32 : 이 프레임 payload의 CRC32 (위조/손상 프레임 즉시 폐기용)
-     - DATA  : payload의 Base64 인코딩
-
-   정확도 확보 전략
-     1. 프레임 단위 CRC32 검증 → 오인식된 프레임은 즉시 폐기 (재조립에 섞이지 않음)
-     2. 파일 전체 CRC32 재검증 → 재조립 후 최종 무결성 확인
-     3. QR을 표준 흑백(검정 모듈 / 흰 배경)으로 렌더링 → 인식 신뢰도 최우선
-     4. 세션 ID로 서로 다른 전송을 격리 → 세션 간 프레임 혼입 방지
-     5. 전송측은 전체 프레임을 무한 반복 → 놓친 프레임은 다음 루프에서 재수신
+   OPTICAL_QR_TRANSFER (GZIP & Canvas Matrix & Memory Optimized)
    ========================================================== */
 
 const FRAME_RE = /^QRS1\|([A-Z0-9]{4})\|(\d+)\|(\d+)\|(\d+)\|([A-Za-z0-9+/=]*)$/;
 
 /* ---------------------------------------------------------- */
-/* CRC32                                                        */
+/* CRC32 & BASE64                                             */
 /* ---------------------------------------------------------- */
 
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-    }
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
     table[n] = c >>> 0;
   }
   return table;
@@ -42,10 +27,6 @@ function crc32(bytes) {
   }
   return (crc ^ 0xFFFFFFFF) >>> 0;
 }
-
-/* ---------------------------------------------------------- */
-/* base64 <-> Uint8Array                                        */
-/* ---------------------------------------------------------- */
 
 function bytesToBase64(bytes) {
   let binary = '';
@@ -64,7 +45,51 @@ function base64ToBytes(b64) {
 }
 
 /* ---------------------------------------------------------- */
-/* misc helpers                                                 */
+/* GZIP 압축 / 해제 함수                                       */
+/* ---------------------------------------------------------- */
+
+async function compressGzip(bytes) {
+  if (!window.CompressionStream) return bytes;
+  const cs = new CompressionStream('gzip');
+  const writer = cs.writable.getWriter();
+  writer.write(bytes);
+  writer.close();
+  const chunks = [];
+  const reader = cs.readable.getReader();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  let totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
+  let result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) { result.set(c, offset); offset += c.length; }
+  return result;
+}
+
+async function decompressGzip(bytes) {
+  if (!window.DecompressionStream) return bytes;
+  const ds = new DecompressionStream('gzip');
+  const writer = ds.writable.getWriter();
+  writer.write(bytes);
+  writer.close();
+  const chunks = [];
+  const reader = ds.readable.getReader();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  let totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
+  let result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) { result.set(c, offset); offset += c.length; }
+  return result;
+}
+
+/* ---------------------------------------------------------- */
+/* Helpers                                                    */
 /* ---------------------------------------------------------- */
 
 function formatBytes(n) {
@@ -116,32 +141,33 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
    ========================================================== */
 
 (function initSender() {
-  const dropZone      = document.getElementById('dropZone');
-  const fileInput      = document.getElementById('fileInput');
-  const dropText       = document.getElementById('dropText');
-  const fileInfo       = document.getElementById('fileInfo');
-  const fileNameEl     = document.getElementById('fileName');
-  const fileSizeEl     = document.getElementById('fileSize');
+  const dropZone          = document.getElementById('dropZone');
+  const fileInput          = document.getElementById('fileInput');
+  const dropText           = document.getElementById('dropText');
+  const fileInfo           = document.getElementById('fileInfo');
+  const fileNameEl         = document.getElementById('fileName');
+  const fileSizeEl         = document.getElementById('fileSize');
+  const useCompressionInput = document.getElementById('useCompression');
 
-  const chunkSizeInput = document.getElementById('chunkSize');
-  const chunkSizeVal   = document.getElementById('chunkSizeVal');
-  const fpsInput       = document.getElementById('fps');
-  const fpsVal         = document.getElementById('fpsVal');
-  const eccGroup       = document.getElementById('eccGroup');
+  const chunkSizeInput     = document.getElementById('chunkSize');
+  const chunkSizeVal       = document.getElementById('chunkSizeVal');
+  const fpsInput           = document.getElementById('fps');
+  const fpsVal             = document.getElementById('fpsVal');
+  const eccGroup           = document.getElementById('eccGroup');
 
-  const btnStartSend   = document.getElementById('btnStartSend');
-  const btnStopSend    = document.getElementById('btnStopSend');
+  const btnStartSend       = document.getElementById('btnStartSend');
+  const btnStopSend        = document.getElementById('btnStopSend');
 
-  const qrCanvas       = document.getElementById('qrCanvas');
-  const qrIdle         = document.getElementById('qrIdle');
-  const qrCtx          = qrCanvas.getContext('2d');
+  const qrCanvas           = document.getElementById('qrCanvas');
+  const qrIdle             = document.getElementById('qrIdle');
+  const qrCtx              = qrCanvas.getContext('2d');
 
-  const sendProgress   = document.getElementById('sendProgress');
-  const sendFrameIdxEl = document.getElementById('sendFrameIdx');
-  const sendFrameTotalEl = document.getElementById('sendFrameTotal');
-  const sendLoopCountEl = document.getElementById('sendLoopCount');
-  const sendLogEl      = document.getElementById('sendLog');
-  const log            = makeLogger(sendLogEl);
+  const sendProgress       = document.getElementById('sendProgress');
+  const sendFrameIdxEl     = document.getElementById('sendFrameIdx');
+  const sendFrameTotalEl   = document.getElementById('sendFrameTotal');
+  const sendLoopCountEl    = document.getElementById('sendLoopCount');
+  const sendLogEl          = document.getElementById('sendLog');
+  const log                = makeLogger(sendLogEl);
 
   const exportRepeatsInput = document.getElementById('exportRepeats');
   const exportRepeatsVal   = document.getElementById('exportRepeatsVal');
@@ -152,21 +178,19 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 
   let currentFile = null;
   let currentFileBytes = null;
-  let currentEcc = 'Q';
+  let currentEcc = 'M';
 
-  let sendFrames = [];      // 프레임 문자열 배열
-  let qrCache = new Map();  // idx -> {count, modules}
+  let sendFrames = [];
+  let qrCache = new Map();
   let sendTimer = null;
   let sendIdx = 0;
   let loopCount = 0;
 
   function setControlsDisabled(disabled) {
-    [chunkSizeInput, fpsInput, fileInput, exportRepeatsInput].forEach(el => el.disabled = disabled);
+    [chunkSizeInput, fpsInput, fileInput, exportRepeatsInput, useCompressionInput].forEach(el => el.disabled = disabled);
     eccGroup.querySelectorAll('button').forEach(b => b.disabled = disabled);
     dropZone.style.pointerEvents = disabled ? 'none' : '';
   }
-
-  // ---- 파일 선택 ----
 
   function handleFile(file) {
     if (!file) return;
@@ -198,8 +222,6 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
   });
 
-  // ---- 컨트롤 ----
-
   chunkSizeInput.addEventListener('input', () => { chunkSizeVal.textContent = chunkSizeInput.value; });
   fpsInput.addEventListener('input', () => { fpsVal.textContent = fpsInput.value; });
   exportRepeatsInput.addEventListener('input', () => { exportRepeatsVal.textContent = exportRepeatsInput.value; });
@@ -213,26 +235,41 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     qrCache.clear();
   });
 
-  // ---- 프레임 빌드 ----
-
-  function buildFrames(bytes, fileMeta, chunkSize) {
+  async function buildFrames(bytes, fileMeta, chunkSize, useComp) {
     const sid = randomSid();
-    const totalDataChunks = Math.max(1, Math.ceil(bytes.length / chunkSize));
-    const total = totalDataChunks + 1; // +1 메타데이터
+    const origCrc = crc32(bytes);
+    let payloadBytes = bytes;
+    let isCompressed = false;
+
+    if (useComp) {
+      log('COMPRESSING_DATA (GZIP)...', 'warn');
+      const comp = await compressGzip(bytes);
+      if (comp.length < bytes.length) {
+        payloadBytes = comp;
+        isCompressed = true;
+        log(`GZIP_SUCCESS: ${formatBytes(bytes.length)} -> ${formatBytes(comp.length)} (${((comp.length / bytes.length) * 100).toFixed(1)}%)`, 'ok');
+      } else {
+        log('GZIP_SKIPPED (압축 효율 낮음)', 'warn');
+      }
+    }
+
+    const totalDataChunks = Math.max(1, Math.ceil(payloadBytes.length / chunkSize));
+    const total = totalDataChunks + 1;
 
     const meta = {
       name: fileMeta.name,
       size: bytes.length,
+      comp: isCompressed ? 'gzip' : 'none',
       mime: fileMeta.type || 'application/octet-stream',
       chunks: totalDataChunks,
-      crc: crc32(bytes)
+      crc: origCrc
     };
     const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
 
     const frames = [makeFrame(sid, 0, total, metaBytes)];
     for (let i = 0; i < totalDataChunks; i++) {
       const start = i * chunkSize;
-      const part = bytes.subarray(start, Math.min(start + chunkSize, bytes.length));
+      const part = payloadBytes.subarray(start, Math.min(start + chunkSize, payloadBytes.length));
       frames.push(makeFrame(sid, i + 1, total, part));
     }
     return frames;
@@ -243,8 +280,6 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     const b64 = bytesToBase64(byteChunk);
     return `QRS1|${sid}|${idx}|${total}|${crc}|${b64}`;
   }
-
-  // ---- QR 렌더링 (표준 흑백 / 크리스프 픽셀) ----
 
   function getQRModules(idx) {
     if (qrCache.has(idx)) return qrCache.get(idx);
@@ -265,8 +300,8 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 
   function drawQR(idx) {
     const { count, modules } = getQRModules(idx);
-    const margin = 4;          // 조용한 영역(quiet zone) — 인식률에 중요
-    const cell = 6;            // 모듈당 픽셀 (크리스프 렌더링)
+    const margin = 4;
+    const cell = 6;
     const totalModules = count + margin * 2;
     const px = totalModules * cell;
 
@@ -283,8 +318,6 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     }
   }
 
-  // ---- 송신 루프 ----
-
   function tickSend() {
     drawQR(sendIdx);
     sendFrameIdxEl.textContent = sendIdx + 1;
@@ -300,13 +333,14 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     }
   }
 
-  function startSend() {
+  async function startSend() {
     if (!currentFile || !currentFileBytes) return;
 
     const chunkSize = parseInt(chunkSizeInput.value, 10);
     const fps = parseInt(fpsInput.value, 10);
+    const useComp = useCompressionInput.checked;
 
-    sendFrames = buildFrames(currentFileBytes, currentFile, chunkSize);
+    sendFrames = await buildFrames(currentFileBytes, currentFile, chunkSize, useComp);
     qrCache.clear();
     sendIdx = 0;
     loopCount = 0;
@@ -334,38 +368,29 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     log('TRANSMISSION_STOPPED', 'warn');
   }
 
-  // ---- 영상 내보내기 (QR 스트림 → webm) ----
-  //
-  // 캔버스 크기가 프레임마다(메타데이터/마지막 청크 등) 다를 수 있어
-  // 라이브 전송용 drawQR을 그대로 쓰면 영상 해상도가 도중에 바뀌어 버린다.
-  // 그래서 내보내기 전체 프레임 중 최대 모듈 수를 먼저 계산해 캔버스 크기를
-  // 고정하고, 작은 프레임은 중앙에 정렬해서 그린다 — 항상 동일 해상도 유지.
-
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
   let exportCancelled = false;
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   async function exportVideo() {
     if (!currentFile || !currentFileBytes) return;
-
     if (!qrCanvas.captureStream || !window.MediaRecorder) {
-      log('ERROR: 이 브라우저는 영상 내보내기(MediaRecorder)를 지원하지 않습니다', 'err');
+      log('ERROR: 브라우저가 MediaRecorder를 지원하지 않습니다', 'err');
       return;
     }
 
-    if (sendTimer) stopSend(); // 실시간 전송 중이면 먼저 중지
+    if (sendTimer) stopSend();
 
     const chunkSize = parseInt(chunkSizeInput.value, 10);
     const fps = parseInt(fpsInput.value, 10);
     const repeats = parseInt(exportRepeatsInput.value, 10);
+    const useComp = useCompressionInput.checked;
 
-    const exportFrames = buildFrames(currentFileBytes, currentFile, chunkSize);
+    const exportFrames = await buildFrames(currentFileBytes, currentFile, chunkSize, useComp);
     const savedFrames = sendFrames;
     const savedCache = qrCache;
     sendFrames = exportFrames;
     qrCache = new Map();
 
-    // 최대 모듈 수 계산 → 고정 해상도 결정
     let maxCount = 0;
     for (let i = 0; i < exportFrames.length; i++) {
       const { count } = getQRModules(i);
@@ -401,7 +426,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     exportStatusLine.textContent = 'RECORDING...';
     log(`VIDEO_EXPORT_START: ${exportFrames.length} FRAMES x${repeats} LOOPS / ${fixedPx}x${fixedPx}px`, 'ok');
 
-    const stream = qrCanvas.captureStream(0); // 수동 프레임 모드
+    const stream = qrCanvas.captureStream(0);
     const track = stream.getVideoTracks()[0];
     const manualFrames = typeof track.requestFrame === 'function';
 
@@ -483,7 +508,9 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   const mCorrupt        = document.getElementById('mCorrupt');
   const mElapsed        = document.getElementById('mElapsed');
   const mSpeed          = document.getElementById('mSpeed');
-  const chunkMatrix      = document.getElementById('chunkMatrix');
+
+  const matrixCanvas    = document.getElementById('matrixCanvas');
+  const matrixCtx       = matrixCanvas.getContext('2d');
 
   const recvResult       = document.getElementById('recvResult');
   const recvFileName     = document.getElementById('recvFileName');
@@ -511,14 +538,14 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   let scanning = false;
   let rafId = null;
 
-  let session = null;      // {sid, total, meta, chunks:Map, corrupt, startTime}
-  let matrixCells = [];
+  let session = null;
   let elapsedTimer = null;
+  let cols = 80;
+  let cellPx = 4;
 
   function newSession() {
     session = { sid: null, total: 0, meta: null, chunks: new Map(), corrupt: 0, startTime: Date.now() };
-    matrixCells = [];
-    chunkMatrix.innerHTML = '';
+    matrixCtx.clearRect(0, 0, matrixCanvas.width, matrixCanvas.height);
     mRecv.textContent = '0/0';
     mCorrupt.textContent = '0';
     mElapsed.textContent = '00:00';
@@ -527,19 +554,35 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     if (recvDownload.href) { URL.revokeObjectURL(recvDownload.href); recvDownload.removeAttribute('href'); }
   }
 
-  function buildMatrix(total) {
-    chunkMatrix.innerHTML = '';
-    matrixCells = new Array(total);
+  // ---- Canvas 기반 매트릭스 구현 (대용량 완벽 대처) ----
+
+  function buildMatrixCanvas(total) {
+    cols = Math.min(100, Math.ceil(Math.sqrt(total * 2)));
+    const rows = Math.ceil(total / cols);
+    cellPx = 4;
+    const gap = 1;
+
+    matrixCanvas.width = cols * (cellPx + gap);
+    matrixCanvas.height = rows * (cellPx + gap);
+
+    matrixCtx.fillStyle = '#1a1a1a';
+    matrixCtx.fillRect(0, 0, matrixCanvas.width, matrixCanvas.height);
+
+    matrixCtx.fillStyle = '#2a2a2a';
     for (let i = 0; i < total; i++) {
-      const cell = document.createElement('div');
-      cell.className = 'matrix-cell';
-      chunkMatrix.appendChild(cell);
-      matrixCells[i] = cell;
+      const c = i % cols;
+      const r = Math.floor(i / cols);
+      matrixCtx.fillRect(c * (cellPx + gap), r * (cellPx + gap), cellPx, cellPx);
     }
   }
 
-  function markCell(idx) {
-    if (matrixCells[idx]) matrixCells[idx].classList.add('received');
+  function markCellCanvas(idx) {
+    if (!session || !session.total) return;
+    const gap = 1;
+    const c = idx % cols;
+    const r = Math.floor(idx / cols);
+    matrixCtx.fillStyle = '#33ff66';
+    matrixCtx.fillRect(c * (cellPx + gap), r * (cellPx + gap), cellPx, cellPx);
   }
 
   // ---- 카메라 제어 ----
@@ -586,8 +629,6 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     log('SESSION_RESET', 'warn');
   }
 
-  // ---- 스캔 루프 ----
-
   function scanLoop() {
     if (!scanning) return;
     if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth) {
@@ -595,8 +636,6 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
       scanCanvas.height = video.videoHeight;
       scanCtx.drawImage(video, 0, 0, scanCanvas.width, scanCanvas.height);
       const imageData = scanCtx.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
-      // 송신측이 항상 표준 흑백(비반전)으로 렌더링하므로 dontInvert로 고정 —
-      // 불필요한 반전 시도를 생략해 프레임당 연산을 줄이고 스캔 주기를 안정화한다.
       const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'dontInvert' });
       if (code && code.data) handleFrame(code.data);
     }
@@ -607,7 +646,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 
   function handleFrame(text) {
     const m = FRAME_RE.exec(text);
-    if (!m) return; // 우리 프로토콜이 아님 — 조용히 무시
+    if (!m) return;
 
     const [, sid, idxStr, totalStr, crcStr, b64] = m;
     const idx = parseInt(idxStr, 10);
@@ -616,14 +655,14 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 
     if (!session) newSession();
 
-    if (session.sid && session.sid !== sid) return; // 다른 세션의 프레임 — 무시 (RESET 필요)
+    if (session.sid && session.sid !== sid) return;
     if (!session.sid) {
       session.sid = sid;
       session.total = total;
-      buildMatrix(total);
+      buildMatrixCanvas(total);
       log(`SESSION_LOCKED: SID=${sid} TOTAL_FRAMES=${total}`, 'ok');
     }
-    if (session.chunks.has(idx)) return; // 이미 수신함 (송신측 반복 루프로 인한 중복)
+    if (session.chunks.has(idx)) return;
 
     let bytes;
     try {
@@ -643,7 +682,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     }
 
     session.chunks.set(idx, bytes);
-    markCell(idx);
+    markCellCanvas(idx);
 
     if (idx === 0) {
       try {
@@ -659,7 +698,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     checkComplete();
   }
 
-  function checkComplete() {
+  async function checkComplete() {
     if (!session.meta) return;
     const need = session.meta.chunks;
     for (let i = 1; i <= need; i++) {
@@ -669,23 +708,37 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     const parts = [];
     for (let i = 1; i <= need; i++) parts.push(session.chunks.get(i));
     const totalLen = parts.reduce((s, p) => s + p.length, 0);
-    const full = new Uint8Array(totalLen);
+    const fullPayload = new Uint8Array(totalLen);
     let offset = 0;
-    for (const p of parts) { full.set(p, offset); offset += p.length; }
+    for (const p of parts) { fullPayload.set(p, offset); offset += p.length; }
 
-    if (crc32(full) !== session.meta.crc) {
-      log('FILE_CRC_MISMATCH — 재조립 실패, 계속 대기 중', 'err');
+    log('REASSEMBLING_FILE...', 'warn');
+
+    let finalBytes = fullPayload;
+    if (session.meta.comp === 'gzip') {
+      try {
+        log('DECOMPRESSING_GZIP...', 'warn');
+        finalBytes = await decompressGzip(fullPayload);
+        log(`DECOMPRESS_SUCCESS: ${formatBytes(fullPayload.length)} -> ${formatBytes(finalBytes.length)}`, 'ok');
+      } catch (e) {
+        log(`DECOMPRESS_FAILED: ${e.message}`, 'err');
+        return;
+      }
+    }
+
+    if (crc32(finalBytes) !== session.meta.crc) {
+      log('FILE_CRC_MISMATCH — 무결성 검증 실패', 'err');
       return;
     }
 
-    const blob = new Blob([full], { type: session.meta.mime || 'application/octet-stream' });
+    const blob = new Blob([finalBytes], { type: session.meta.mime || 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
     recvDownload.href = url;
     recvDownload.download = session.meta.name || 'received_file';
     recvFileName.textContent = `${session.meta.name} (${formatBytes(session.meta.size)})`;
     recvResult.classList.remove('hidden');
     log(`TRANSFER_COMPLETE: ${session.meta.name}`, 'ok');
-    stopScan();
+    if (scanning) stopScan();
   }
 
   function updateMetrics() {
@@ -706,20 +759,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     mElapsed.textContent = formatTime((Date.now() - session.startTime) / 1000);
   }
 
-  // ---- 영상 업로드 분석 (2단계 파이프라인) ----
-  //
-  // [1단계] EXTRACT: requestVideoFrameCallback으로 비디오가 실제로 화면에
-  //   그리는 모든 프레임을 하나도 놓치지 않고 캡처해 ImageData 배열로 쪼갠다.
-  //   고정 ms 간격으로 seek하던 예전 방식은 실제 프레임 경계와 어긋나면
-  //   QR 프레임 자체를 통째로 건너뛸 수 있었는데, 이 방식은 브라우저가
-  //   "이 시점에 이 프레임을 그렸다"고 알려주는 이벤트를 그대로 따라가므로
-  //   원본 프레임을 빠짐없이 자동으로 인식해 분리한다.
-  // [2단계] DECODE: 쪼개진 이미지 전부를 촤라락 훑으며 jsQR로 일괄 인식한다.
-  //   이미 프레임이 전부 메모리에 있으므로 재생/디코딩 대기 없이 순수 연산
-  //   속도로만 처리되어 매우 빠르다.
-  //
-  // requestVideoFrameCallback을 지원하지 않는 구형 브라우저에서는 기존의
-  // 촘촘한 seek 샘플링 방식으로 자동 대체(fallback)된다.
+  // ---- 영상 파일 분석 로직 (스트리밍 메모리 최적화) ----
 
   let pendingVideoFile = null;
   let analyzing = false;
@@ -761,23 +801,32 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     });
   }
 
-  // [1단계-A] rVFC 기반: 실제 렌더링되는 프레임을 전부 캡처해 ImageData 배열로 쪼갠다.
-  function extractFramesViaRVFC(vid, canvas, ctx, speed, onProgress) {
+  // 메모리를 안 먹는 실시간 디코딩 기반 rVFC
+  function analyzeStreamViaRVFC(vid, canvas, ctx, speed, onProgress) {
     return new Promise((resolve, reject) => {
-      const frames = [];
-      let cancelled = false;
+      let count = 0;
+      let recognized = 0;
 
       function stop() {
-        cancelled = true;
         vid.pause();
-        resolve(frames);
+        resolve({ count, recognized });
       }
 
       function onFrame(now, metadata) {
         if (cancelAnalyze) { stop(); return; }
         ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-        frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
-        onProgress(metadata.mediaTime, vid.duration || 1, frames.length);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        
+        // 프레임 저장 없이 "즉시 디코딩"!
+        const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'attemptBoth' });
+        if (code && code.data) {
+          handleFrame(code.data);
+          recognized++;
+        }
+
+        count++;
+        onProgress(metadata.mediaTime, vid.duration || 1, count, recognized);
+
         if (vid.ended || (vid.duration && metadata.mediaTime >= vid.duration - 1 / 120)) {
           stop();
           return;
@@ -785,8 +834,8 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
         vid.requestVideoFrameCallback(onFrame);
       }
 
-      vid.addEventListener('ended', () => { if (!cancelled) stop(); }, { once: true });
-      vid.addEventListener('error', () => { if (!cancelled) reject(new Error('영상 재생 중 오류')); }, { once: true });
+      vid.addEventListener('ended', () => stop(), { once: true });
+      vid.addEventListener('error', () => reject(new Error('영상 재생 중 오류 발생')), { once: true });
 
       vid.playbackRate = speed;
       vid.requestVideoFrameCallback(onFrame);
@@ -794,34 +843,45 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     });
   }
 
-  // [1단계-B] fallback: rVFC 미지원 브라우저용 — 촘촘한 seek 샘플링
-  async function extractFramesViaSeek(vid, canvas, ctx, onProgress) {
-    const frames = [];
+  // Fallback Seek 방식도 실시간 즉시 디코딩
+  async function analyzeStreamViaSeek(vid, canvas, ctx, onProgress) {
     const duration = vid.duration || 0;
-    const step = 1 / 30; // 대략 30fps 가정 — 프레임을 놓치지 않도록 촘촘히
+    const step = 1 / 30;
     let t = 0;
+    let count = 0;
+    let recognized = 0;
+
     while (t <= duration + 1e-6) {
       if (cancelAnalyze) break;
       await seekTo(vid, t);
       ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-      frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
-      onProgress(t, duration || 1, frames.length);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      
+      const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'attemptBoth' });
+      if (code && code.data) {
+        handleFrame(code.data);
+        recognized++;
+      }
+
+      count++;
+      onProgress(t, duration || 1, count, recognized);
       t += step;
     }
-    return frames;
+
+    return { count, recognized };
   }
 
   async function analyzeVideo() {
     if (!pendingVideoFile || analyzing) return;
-    if (scanning) stopScan(); // 라이브 스캔 중이면 먼저 중지
+    if (scanning) stopScan();
     if (!session) newSession();
 
     analyzing = true;
     cancelAnalyze = false;
     btnAnalyzeVideo.classList.add('hidden');
     btnStopAnalyze.classList.remove('hidden');
-    analyzeStatusLine.textContent = 'EXTRACTING_FRAMES...';
-    log(`VIDEO_ANALYSIS_START: ${pendingVideoFile.name} (${RVFC_SUPPORTED ? 'RVFC' : 'SEEK_FALLBACK'})`, 'ok');
+    analyzeStatusLine.textContent = 'ANALYZING_STREAM...';
+    log(`STREAM_ANALYSIS_START: ${pendingVideoFile.name}`, 'ok');
 
     const vid = document.createElement('video');
     vid.muted = true;
@@ -832,7 +892,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     try {
       await new Promise((resolve, reject) => {
         vid.addEventListener('loadedmetadata', resolve, { once: true });
-        vid.addEventListener('error', () => reject(new Error('비디오를 열 수 없습니다')), { once: true });
+        vid.addEventListener('error', () => reject(new Error('비디오를 읽을 수 없습니다')), { once: true });
       });
     } catch (err) {
       log(`ERROR: ${err.message}`, 'err');
@@ -849,17 +909,17 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     canvas.height = vid.videoHeight;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-    const onExtractProgress = (t, duration, count) => {
+    const onProgress = (t, duration, count, recognized) => {
       analyzeProgress.style.width = `${Math.min(100, (t / duration) * 100)}%`;
-      analyzeStatusLine.textContent = `EXTRACTING_FRAMES... (${count})`;
+      analyzeStatusLine.textContent = `ANALYZING... ${count} FRAMES (${recognized} QR HIT)`;
     };
 
-    let frames = [];
+    let result = { count: 0, recognized: 0 };
     try {
       const speed = parseInt(playbackSpeedInput.value, 10) || 1;
-      frames = RVFC_SUPPORTED
-        ? await extractFramesViaRVFC(vid, canvas, ctx, speed, onExtractProgress)
-        : await extractFramesViaSeek(vid, canvas, ctx, onExtractProgress);
+      result = RVFC_SUPPORTED
+        ? await analyzeStreamViaRVFC(vid, canvas, ctx, speed, onProgress)
+        : await analyzeStreamViaSeek(vid, canvas, ctx, onProgress);
     } catch (err) {
       log(`ERROR: ${err.message}`, 'err');
       URL.revokeObjectURL(url);
@@ -870,43 +930,17 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
       return;
     }
 
-    // rVFC 경로에서 디코딩이 재생 속도를 못 따라가 프레임이 누락된 경우 경고
-    if (RVFC_SUPPORTED && vid.getVideoPlaybackQuality) {
-      const q = vid.getVideoPlaybackQuality();
-      if (q.droppedVideoFrames > 0) {
-        log(`WARNING: 배속이 너무 높아 ${q.droppedVideoFrames} 프레임이 드롭됨 — EXTRACT_SPEED를 낮춰 재시도 권장`, 'warn');
-      }
-    }
-
-    log(`FRAMES_EXTRACTED: ${frames.length}장 — 일괄 인식 시작`, 'ok');
     URL.revokeObjectURL(url);
-
-    // [2단계] 쪼갠 이미지를 전부 촤라락 훑으며 일괄 인식
-    analyzeStatusLine.textContent = 'RECOGNIZING...';
-    let recognized = 0;
-    for (let i = 0; i < frames.length; i++) {
-      if (cancelAnalyze) break;
-      const imageData = frames[i];
-      // 외부에서 만들어진 영상일 수도 있으므로 반전 색상까지 함께 시도한다
-      const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'attemptBoth' });
-      if (code && code.data) { handleFrame(code.data); recognized++; }
-      if (i % 5 === 0) {
-        analyzeProgress.style.width = `${Math.min(100, (i / frames.length) * 100)}%`;
-        analyzeStatusLine.textContent = `RECOGNIZING... (${i + 1}/${frames.length})`;
-        await new Promise(r => setTimeout(r, 0)); // UI 갱신을 위한 양보
-      }
-    }
-
     analyzing = false;
     btnAnalyzeVideo.classList.remove('hidden');
     btnStopAnalyze.classList.add('hidden');
     analyzeProgress.style.width = '0%';
 
     if (cancelAnalyze) {
-      log(`VIDEO_ANALYSIS_CANCELLED (${frames.length} FRAMES_EXTRACTED, ${recognized} QR_HIT)`, 'warn');
+      log(`ANALYSIS_CANCELLED (${result.count} FRAMES, ${result.recognized} QR HIT)`, 'warn');
       analyzeStatusLine.textContent = 'CANCELLED';
     } else {
-      log(`VIDEO_ANALYSIS_DONE: ${frames.length} FRAMES_EXTRACTED, ${recognized} QR_HIT`, 'ok');
+      log(`ANALYSIS_DONE: ${result.count} FRAMES PROCESSED, ${result.recognized} QR HIT`, 'ok');
       analyzeStatusLine.textContent = 'DONE';
     }
   }
