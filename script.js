@@ -497,8 +497,8 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   const videoDropText    = document.getElementById('videoDropText');
   const videoFileInfo    = document.getElementById('videoFileInfo');
   const videoFileNameEl  = document.getElementById('videoFileName');
-  const sampleIntervalInput = document.getElementById('sampleInterval');
-  const sampleIntervalVal   = document.getElementById('sampleIntervalVal');
+  const playbackSpeedInput = document.getElementById('playbackSpeed');
+  const playbackSpeedVal   = document.getElementById('playbackSpeedVal');
   const btnAnalyzeVideo  = document.getElementById('btnAnalyzeVideo');
   const btnStopAnalyze   = document.getElementById('btnStopAnalyze');
   const analyzeProgress  = document.getElementById('analyzeProgress');
@@ -706,16 +706,26 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     mElapsed.textContent = formatTime((Date.now() - session.startTime) / 1000);
   }
 
-  // ---- 영상 업로드 분석 ----
+  // ---- 영상 업로드 분석 (2단계 파이프라인) ----
   //
-  // 실시간 카메라 스캔과 달리 재생 속도에 의존하지 않고, video.currentTime을
-  // 일정 간격으로 정밀하게 이동(seek)시키며 프레임을 하나씩 캡처해 분석한다.
-  // 재생 기반 방식은 디코딩 속도에 따라 프레임을 건너뛸 수 있지만, seek 기반은
-  // 설정한 간격의 프레임을 놓치지 않고 전부 검사하므로 인식 정확도가 더 높다.
+  // [1단계] EXTRACT: requestVideoFrameCallback으로 비디오가 실제로 화면에
+  //   그리는 모든 프레임을 하나도 놓치지 않고 캡처해 ImageData 배열로 쪼갠다.
+  //   고정 ms 간격으로 seek하던 예전 방식은 실제 프레임 경계와 어긋나면
+  //   QR 프레임 자체를 통째로 건너뛸 수 있었는데, 이 방식은 브라우저가
+  //   "이 시점에 이 프레임을 그렸다"고 알려주는 이벤트를 그대로 따라가므로
+  //   원본 프레임을 빠짐없이 자동으로 인식해 분리한다.
+  // [2단계] DECODE: 쪼개진 이미지 전부를 촤라락 훑으며 jsQR로 일괄 인식한다.
+  //   이미 프레임이 전부 메모리에 있으므로 재생/디코딩 대기 없이 순수 연산
+  //   속도로만 처리되어 매우 빠르다.
+  //
+  // requestVideoFrameCallback을 지원하지 않는 구형 브라우저에서는 기존의
+  // 촘촘한 seek 샘플링 방식으로 자동 대체(fallback)된다.
 
   let pendingVideoFile = null;
   let analyzing = false;
   let cancelAnalyze = false;
+
+  const RVFC_SUPPORTED = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
 
   videoFileInput.addEventListener('change', e => {
     const f = e.target.files[0];
@@ -741,7 +751,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     }
   });
 
-  sampleIntervalInput.addEventListener('input', () => { sampleIntervalVal.textContent = sampleIntervalInput.value; });
+  playbackSpeedInput.addEventListener('input', () => { playbackSpeedVal.textContent = playbackSpeedInput.value; });
 
   function seekTo(vid, time) {
     return new Promise(resolve => {
@@ -749,6 +759,56 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
       vid.addEventListener('seeked', onSeeked);
       vid.currentTime = Math.min(time, vid.duration || time);
     });
+  }
+
+  // [1단계-A] rVFC 기반: 실제 렌더링되는 프레임을 전부 캡처해 ImageData 배열로 쪼갠다.
+  function extractFramesViaRVFC(vid, canvas, ctx, speed, onProgress) {
+    return new Promise((resolve, reject) => {
+      const frames = [];
+      let cancelled = false;
+
+      function stop() {
+        cancelled = true;
+        vid.pause();
+        resolve(frames);
+      }
+
+      function onFrame(now, metadata) {
+        if (cancelAnalyze) { stop(); return; }
+        ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+        frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+        onProgress(metadata.mediaTime, vid.duration || 1, frames.length);
+        if (vid.ended || (vid.duration && metadata.mediaTime >= vid.duration - 1 / 120)) {
+          stop();
+          return;
+        }
+        vid.requestVideoFrameCallback(onFrame);
+      }
+
+      vid.addEventListener('ended', () => { if (!cancelled) stop(); }, { once: true });
+      vid.addEventListener('error', () => { if (!cancelled) reject(new Error('영상 재생 중 오류')); }, { once: true });
+
+      vid.playbackRate = speed;
+      vid.requestVideoFrameCallback(onFrame);
+      vid.play().catch(reject);
+    });
+  }
+
+  // [1단계-B] fallback: rVFC 미지원 브라우저용 — 촘촘한 seek 샘플링
+  async function extractFramesViaSeek(vid, canvas, ctx, onProgress) {
+    const frames = [];
+    const duration = vid.duration || 0;
+    const step = 1 / 30; // 대략 30fps 가정 — 프레임을 놓치지 않도록 촘촘히
+    let t = 0;
+    while (t <= duration + 1e-6) {
+      if (cancelAnalyze) break;
+      await seekTo(vid, t);
+      ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+      frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+      onProgress(t, duration || 1, frames.length);
+      t += step;
+    }
+    return frames;
   }
 
   async function analyzeVideo() {
@@ -760,8 +820,8 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     cancelAnalyze = false;
     btnAnalyzeVideo.classList.add('hidden');
     btnStopAnalyze.classList.remove('hidden');
-    analyzeStatusLine.textContent = 'ANALYZING...';
-    log(`VIDEO_ANALYSIS_START: ${pendingVideoFile.name}`, 'ok');
+    analyzeStatusLine.textContent = 'EXTRACTING_FRAMES...';
+    log(`VIDEO_ANALYSIS_START: ${pendingVideoFile.name} (${RVFC_SUPPORTED ? 'RVFC' : 'SEEK_FALLBACK'})`, 'ok');
 
     const vid = document.createElement('video');
     vid.muted = true;
@@ -789,36 +849,64 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     canvas.height = vid.videoHeight;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-    const step = parseInt(sampleIntervalInput.value, 10) / 1000;
-    const duration = vid.duration || 0;
-    let t = 0;
-    let sampled = 0;
+    const onExtractProgress = (t, duration, count) => {
+      analyzeProgress.style.width = `${Math.min(100, (t / duration) * 100)}%`;
+      analyzeStatusLine.textContent = `EXTRACTING_FRAMES... (${count})`;
+    };
 
-    while (t <= duration + 1e-6) {
-      if (cancelAnalyze) break;
-      await seekTo(vid, t);
-      ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      // 외부에서 만들어진 영상일 수도 있으므로 반전 색상까지 함께 시도한다
-      // (실시간 카메라 스캔과 달리 성능보다 정확도를 우선한다)
-      const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'attemptBoth' });
-      if (code && code.data) handleFrame(code.data);
-      sampled++;
-      analyzeProgress.style.width = `${Math.min(100, (t / (duration || 1)) * 100)}%`;
-      t += step;
+    let frames = [];
+    try {
+      const speed = parseInt(playbackSpeedInput.value, 10) || 1;
+      frames = RVFC_SUPPORTED
+        ? await extractFramesViaRVFC(vid, canvas, ctx, speed, onExtractProgress)
+        : await extractFramesViaSeek(vid, canvas, ctx, onExtractProgress);
+    } catch (err) {
+      log(`ERROR: ${err.message}`, 'err');
+      URL.revokeObjectURL(url);
+      analyzing = false;
+      btnAnalyzeVideo.classList.remove('hidden');
+      btnStopAnalyze.classList.add('hidden');
+      analyzeStatusLine.textContent = 'ERROR';
+      return;
     }
 
+    // rVFC 경로에서 디코딩이 재생 속도를 못 따라가 프레임이 누락된 경우 경고
+    if (RVFC_SUPPORTED && vid.getVideoPlaybackQuality) {
+      const q = vid.getVideoPlaybackQuality();
+      if (q.droppedVideoFrames > 0) {
+        log(`WARNING: 배속이 너무 높아 ${q.droppedVideoFrames} 프레임이 드롭됨 — EXTRACT_SPEED를 낮춰 재시도 권장`, 'warn');
+      }
+    }
+
+    log(`FRAMES_EXTRACTED: ${frames.length}장 — 일괄 인식 시작`, 'ok');
     URL.revokeObjectURL(url);
+
+    // [2단계] 쪼갠 이미지를 전부 촤라락 훑으며 일괄 인식
+    analyzeStatusLine.textContent = 'RECOGNIZING...';
+    let recognized = 0;
+    for (let i = 0; i < frames.length; i++) {
+      if (cancelAnalyze) break;
+      const imageData = frames[i];
+      // 외부에서 만들어진 영상일 수도 있으므로 반전 색상까지 함께 시도한다
+      const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'attemptBoth' });
+      if (code && code.data) { handleFrame(code.data); recognized++; }
+      if (i % 5 === 0) {
+        analyzeProgress.style.width = `${Math.min(100, (i / frames.length) * 100)}%`;
+        analyzeStatusLine.textContent = `RECOGNIZING... (${i + 1}/${frames.length})`;
+        await new Promise(r => setTimeout(r, 0)); // UI 갱신을 위한 양보
+      }
+    }
+
     analyzing = false;
     btnAnalyzeVideo.classList.remove('hidden');
     btnStopAnalyze.classList.add('hidden');
     analyzeProgress.style.width = '0%';
 
     if (cancelAnalyze) {
-      log(`VIDEO_ANALYSIS_CANCELLED (${sampled} FRAMES_SAMPLED)`, 'warn');
+      log(`VIDEO_ANALYSIS_CANCELLED (${frames.length} FRAMES_EXTRACTED, ${recognized} QR_HIT)`, 'warn');
       analyzeStatusLine.textContent = 'CANCELLED';
     } else {
-      log(`VIDEO_ANALYSIS_DONE: ${sampled} FRAMES_SAMPLED`, 'ok');
+      log(`VIDEO_ANALYSIS_DONE: ${frames.length} FRAMES_EXTRACTED, ${recognized} QR_HIT`, 'ok');
       analyzeStatusLine.textContent = 'DONE';
     }
   }
